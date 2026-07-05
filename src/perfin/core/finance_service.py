@@ -58,6 +58,10 @@ class FinanceService:
         with session_scope(self._sessions) as session:
             return SqlTransactionRepo(session).query(query)
 
+    def get_profile(self):
+        with session_scope(self._sessions) as session:
+            return SqlProfileRepo(session).get() or _empty_profile()
+
     def spending_summary(
         self, *, months: int = 1, group_by: str = "category"
     ) -> SpendingSummary:

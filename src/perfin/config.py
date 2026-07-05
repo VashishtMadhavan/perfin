@@ -23,6 +23,7 @@ DATA_DIR = Path(_DIRS.user_data_dir)
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 DB_PATH = DATA_DIR / "perfin.db"
 SECRETS_FALLBACK_PATH = DATA_DIR / "secrets.json"
+ASK_CONSENT_PATH = DATA_DIR / "ask_consent.json"
 
 
 class PlaidSettings(BaseSettings):

@@ -9,7 +9,11 @@ from typing import Any
 import plaid
 from plaid.api import plaid_api
 from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+from plaid.model.country_code import CountryCode
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
+from plaid.model.link_token_create_hosted_link import LinkTokenCreateHostedLink
+from plaid.model.link_token_create_request import LinkTokenCreateRequest
+from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.products import Products
 from plaid.model.sandbox_public_token_create_request import (
     SandboxPublicTokenCreateRequest,
@@ -40,7 +44,9 @@ class PlaidSource:
 
     def link(self) -> LinkResult:
         if self._settings.plaid.env != "sandbox":
-            raise NotImplementedError("Hosted Link is planned for Phase 5.")
+            raise RuntimeError(
+                "Use create_hosted_link_url(), then exchange the returned public token."
+            )
         public_token_response = self._client.sandbox_public_token_create(
             SandboxPublicTokenCreateRequest(
                 institution_id=self._sandbox_institution_id,
@@ -48,6 +54,35 @@ class PlaidSource:
             )
         )
         public_token = _get(public_token_response, "public_token")
+        return self.exchange_public_token(
+            str(_get(public_token_response, "public_token")),
+            institution_id=self._sandbox_institution_id,
+            institution_name="Plaid Sandbox",
+        )
+
+    def create_hosted_link_url(self) -> str:
+        response = self._client.link_token_create(
+            LinkTokenCreateRequest(
+                client_name="Perfin",
+                language="en",
+                country_codes=[CountryCode("US")],
+                user=LinkTokenCreateRequestUser(client_user_id="perfin-local-user"),
+                products=[Products("transactions")],
+                hosted_link=LinkTokenCreateHostedLink(url_lifetime_seconds=1800),
+            )
+        )
+        hosted_url = _get(response, "hosted_link_url")
+        if not hosted_url:
+            raise RuntimeError("Plaid did not return a hosted_link_url.")
+        return str(hosted_url)
+
+    def exchange_public_token(
+        self,
+        public_token: str,
+        *,
+        institution_id: str | None = None,
+        institution_name: str | None = None,
+    ) -> LinkResult:
         exchange_response = self._client.item_public_token_exchange(
             ItemPublicTokenExchangeRequest(public_token=public_token)
         )
@@ -57,8 +92,8 @@ class PlaidSource:
         self._secrets.set(access_token_ref, access_token)
         item = PlaidItem(
             item_id=item_id,
-            institution_id=self._sandbox_institution_id,
-            institution_name="Plaid Sandbox",
+            institution_id=institution_id,
+            institution_name=institution_name,
             access_token_ref=access_token_ref,
         )
         return LinkResult(item=item, accounts=self.fetch_accounts(item))

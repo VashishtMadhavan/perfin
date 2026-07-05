@@ -8,18 +8,24 @@ staleness gate. Command modules register their own sub-apps / commands here.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from decimal import Decimal
+from pathlib import Path
 
 import typer
 
+from perfin.agent.client import AnthropicAgentClient
+from perfin.agent.loop import run_agent_loop
+from perfin.agent.tools import ToolDispatcher
 from perfin import __version__
 from perfin.cli.render import console, money, pct, simple_table
-from perfin.config import get_settings
+from perfin.config import ASK_CONSENT_PATH, get_settings
 from perfin.core.finance_service import FinanceService
 from perfin.core.models import RiskTolerance
 from perfin.core.profile_service import ProfileService
 from perfin.core.sync_service import SyncService
 from perfin.datasources.fake_source import FakeDataSource
+from perfin.datasources.csv_source import CsvSource
 from perfin.datasources.plaid_source import PlaidSource
 from perfin.secrets import DefaultSecretStore
 from perfin.storage.db import create_db_engine, create_session_factory, init_schema
@@ -72,7 +78,7 @@ def main(
     """Root callback: wire dependencies and gate on data freshness."""
     ctx.ensure_object(dict)
     ctx.obj["no_sync"] = no_sync
-    read_commands = {"spend", "networth", "savings-rate", "afford", "retire"}
+    read_commands = {"spend", "networth", "savings-rate", "afford", "retire", "ask"}
     if no_sync or ctx.invoked_subcommand not in read_commands:
         return
     settings = get_settings()
@@ -90,11 +96,35 @@ def link_command(
     source: str = typer.Option(
         "plaid", "--source", help="Data source to link. Use 'plaid' or 'fake'."
     ),
+    public_token: str | None = typer.Option(
+        None,
+        "--public-token",
+        help="Exchange a public token from Hosted Link.",
+    ),
     sync_after: bool = typer.Option(True, "--sync/--no-sync", help="Run initial sync."),
 ) -> None:
     """Link an institution or demo data source."""
     data_source = _source(source)
     service = SyncService(_session_factory())
+    if public_token is not None:
+        if not isinstance(data_source, PlaidSource):
+            raise typer.BadParameter("--public-token is only valid for Plaid.")
+        result = data_source.exchange_public_token(public_token)
+        service.save_link_result(result)
+        if sync_after:
+            report = service.sync_item(data_source, result.item.item_id)
+            console.print(
+                f"Linked and synced {report.item_id}: {report.accounts} accounts, "
+                f"{report.added} added."
+            )
+        else:
+            console.print(f"Linked {result.item.item_id}.")
+        return
+    if isinstance(data_source, PlaidSource) and get_settings().plaid.env != "sandbox":
+        url = data_source.create_hosted_link_url()
+        console.print("Open this Hosted Link URL, then rerun with --public-token:")
+        console.print(url)
+        return
     if sync_after:
         report = service.sync(data_source)
         console.print(
@@ -119,6 +149,32 @@ def sync_command(
         f"Synced {report.item_id}: {report.accounts} accounts, "
         f"{report.added} added, {report.modified} modified, "
         f"{report.removed} removed across {report.batches} batch(es)."
+    )
+
+
+@app.command("import-csv")
+def import_csv_command(
+    path: Path = typer.Argument(..., help="CSV with date, amount, and name columns."),
+    account_name: str = typer.Option("CSV Import", "--account-name"),
+    current_balance: str | None = typer.Option(None, "--current-balance"),
+    invert_amounts: bool = typer.Option(
+        False,
+        "--invert-amounts",
+        help="Flip signs for CSVs where spending is negative.",
+    ),
+    full: bool = typer.Option(False, "--full", help="Re-import even if cursor is done."),
+) -> None:
+    """Import transactions from a local CSV file."""
+    source = CsvSource(
+        path,
+        account_name=account_name,
+        current_balance=_decimal_option(current_balance, "current balance"),
+        invert_amounts=invert_amounts,
+    )
+    report = SyncService(_session_factory()).sync(source, full=full)
+    console.print(
+        f"Imported {report.added} transaction(s) from {path} "
+        f"into {report.item_id}."
     )
 
 
@@ -236,6 +292,30 @@ def retire_command(
     console.print(table)
 
 
+@app.command("ask")
+def ask_command(
+    question: str = typer.Argument(..., help="Question to answer from local data."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Accept the one-time Anthropic tool-result privacy notice.",
+    ),
+) -> None:
+    """Ask an LLM-backed personal-finance question."""
+    settings = get_settings()
+    _ensure_ask_consent(yes=yes)
+    finance = FinanceService(_session_factory())
+    answer = run_agent_loop(
+        question,
+        client=AnthropicAgentClient(settings.llm),
+        dispatcher=ToolDispatcher(finance),
+        max_iterations=settings.llm.max_iterations,
+    )
+    if answer.refused:
+        console.print("[yellow]The model refused to answer.[/yellow]")
+    console.print(answer.text)
+
+
 @app.command("profile")
 def profile_command(
     birth_year: int | None = typer.Option(None, "--birth-year"),
@@ -317,6 +397,20 @@ def _date_option(value: str | None, label: str) -> dt.date | None:
         return dt.date.fromisoformat(value)
     except ValueError as exc:
         raise typer.BadParameter(f"{label} must use YYYY-MM-DD") from exc
+
+
+def _ensure_ask_consent(*, yes: bool) -> None:
+    if ASK_CONSENT_PATH.is_file():
+        return
+    notice = (
+        "perfin ask sends selected local finance tool results to the Anthropic API "
+        "so the model can answer your question."
+    )
+    if not yes and not typer.confirm(notice + " Continue?"):
+        raise typer.Abort()
+    ASK_CONSENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ASK_CONSENT_PATH.open("w", encoding="utf-8") as fh:
+        json.dump({"accepted": True, "accepted_at": dt.datetime.now(dt.UTC).isoformat()}, fh)
 
 
 if __name__ == "__main__":

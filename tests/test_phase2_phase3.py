@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 
-from perfin.config import Settings
+from perfin.config import PlaidSettings, Settings
 from perfin.core.finance_service import FinanceService
 from perfin.core.profile_service import ProfileService
 from perfin.core.sync_service import SyncService
@@ -34,6 +34,16 @@ def test_plaid_source_maps_sandbox_link_accounts_and_sync(tmp_path) -> None:
     assert batch.added[0].category_primary == "FOOD_AND_DRINK"
     assert batch.removed == ["removed-1"]
     assert batch.next_cursor == "cursor-1"
+
+
+def test_plaid_source_creates_hosted_link_url(tmp_path) -> None:
+    source = PlaidSource(
+        Settings(plaid=PlaidSettings(env="development")),
+        FileFallbackStore(tmp_path / "secrets.json"),
+        client=_FakePlaidClient(),
+    )
+
+    assert source.create_hosted_link_url() == "https://hosted-link.example/session"
 
 
 def test_affordability_and_retirement_facades() -> None:
@@ -111,3 +121,8 @@ class _FakePlaidClient:
             "next_cursor": "cursor-1",
             "has_more": False,
         }
+
+    def link_token_create(self, request):
+        assert request.client_name == "Perfin"
+        assert request.hosted_link is not None
+        return {"hosted_link_url": "https://hosted-link.example/session"}

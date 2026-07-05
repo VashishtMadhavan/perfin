@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session, sessionmaker
 
 from perfin.core.models import BalanceSnapshot
-from perfin.datasources.base import DataSource
+from perfin.datasources.base import DataSource, LinkResult
 from perfin.storage.db import session_scope
 from perfin.storage.repositories import (
     SqlAccountRepo,
@@ -39,13 +39,16 @@ class SyncService:
 
     def link(self, source: DataSource) -> str:
         result = source.link()
+        self.save_link_result(result)
+        return result.item.item_id
+
+    def save_link_result(self, result: LinkResult) -> None:
         with session_scope(self._sessions) as session:
             items = SqlItemRepo(session)
             accounts = SqlAccountRepo(session)
             items.upsert(result.item)
             for account in result.accounts:
                 accounts.upsert(account)
-        return result.item.item_id
 
     def ensure_fresh(
         self, source: DataSource, *, staleness: dt.timedelta

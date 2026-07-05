@@ -25,11 +25,30 @@ uv run perfin retire --age 65 --annual-contribution 18000
 uv run perfin profile
 ```
 
+Import a local transaction CSV with `date`, `amount`, and `name` columns:
+
+```bash
+uv run perfin import-csv transactions.csv --account-name "Checking"
+```
+
+Ask an LLM-backed question over local data:
+
+```bash
+ANTHROPIC_API_KEY=... uv run perfin ask "Can I afford a 3000 vacation?"
+```
+
 Plaid sandbox wiring is available behind an explicit source flag:
 
 ```bash
 PLAID_CLIENT_ID=... PLAID_SECRET=... uv run perfin link --source plaid
 uv run perfin sync --source plaid
+```
+
+For non-sandbox Plaid environments, `link --source plaid` prints a Hosted Link
+URL. Complete Link, then exchange the returned public token:
+
+```bash
+uv run perfin link --source plaid --public-token public-...
 ```
 
 `PERFIN_SYNC_DEFAULT_SOURCE` controls the auto-sync source and defaults to
