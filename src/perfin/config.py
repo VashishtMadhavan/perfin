@@ -39,6 +39,7 @@ class SyncSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PERFIN_SYNC_", extra="ignore")
 
     staleness_hours: float = 6.0
+    default_source: str = "fake"
 
 
 class LLMSettings(BaseSettings):

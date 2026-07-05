@@ -19,6 +19,9 @@ class FakeDataSource:
     def link(self) -> LinkResult:
         return LinkResult(item=self._item(cursor=None), accounts=self._accounts())
 
+    def matches_item(self, item: PlaidItem) -> bool:
+        return item.item_id == self.item_id
+
     def fetch_accounts(self, item: PlaidItem) -> list[Account]:
         return self._accounts()
 

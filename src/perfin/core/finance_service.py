@@ -8,15 +8,17 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from perfin.analytics.affordability import AffordabilityResult, check_affordability
 from perfin.analytics.networth import (
     AccountContribution,
     NetWorthPoint,
     current_networth,
     snapshot_series,
 )
+from perfin.analytics.retirement import RetirementProjection, project_retirement
 from perfin.analytics.savings import SavingsRate, calculate_savings_rate
 from perfin.analytics.spending import SpendingRow, rollup_spending
-from perfin.core.models import Account
+from perfin.core.models import Account, Transaction
 from perfin.storage.base import TransactionQuery
 from perfin.storage.db import session_scope
 from perfin.storage.repositories import (
@@ -51,6 +53,10 @@ class FinanceService:
     def list_accounts(self) -> list[Account]:
         with session_scope(self._sessions) as session:
             return SqlAccountRepo(session).list_all()
+
+    def query_transactions(self, query: TransactionQuery) -> list[Transaction]:
+        with session_scope(self._sessions) as session:
+            return SqlTransactionRepo(session).query(query)
 
     def spending_summary(
         self, *, months: int = 1, group_by: str = "category"
@@ -88,6 +94,66 @@ class FinanceService:
             )
             profile = SqlProfileRepo(session).get()
         return calculate_savings_rate(txns, months=months, profile=profile)
+
+    def affordability(
+        self, *, amount: Decimal, months: int = 3, by_date: dt.date | None = None
+    ) -> AffordabilityResult:
+        end = dt.date.today()
+        start = _add_months(end, -months)
+        with session_scope(self._sessions) as session:
+            accounts = SqlAccountRepo(session).list_all()
+            txns = SqlTransactionRepo(session).query(
+                TransactionQuery(start_date=start, end_date=end, include_pending=False)
+            )
+            profile = SqlProfileRepo(session).get()
+        profile = profile or _empty_profile()
+        savings_rate = calculate_savings_rate(txns, months=months, profile=profile)
+        return check_affordability(
+            amount,
+            accounts=accounts,
+            transactions=txns,
+            savings_rate=savings_rate,
+            profile=profile,
+            by_date=by_date,
+        )
+
+    def retirement_projection(
+        self,
+        *,
+        months: int = 12,
+        annual_contribution: Decimal | None = None,
+        retirement_age: int | None = None,
+    ) -> RetirementProjection:
+        with session_scope(self._sessions) as session:
+            accounts = SqlAccountRepo(session).list_all()
+            profile = SqlProfileRepo(session).get()
+            end = dt.date.today()
+            start = _add_months(end, -months)
+            txns = SqlTransactionRepo(session).query(
+                TransactionQuery(start_date=start, end_date=end, include_pending=False)
+            )
+        profile = profile or _empty_profile()
+        starting_balance, _ = current_networth(accounts)
+        if annual_contribution is None:
+            if profile.monthly_savings_target is not None:
+                annual_contribution = profile.monthly_savings_target * Decimal(12)
+            else:
+                savings_rate = calculate_savings_rate(
+                    txns, months=months, profile=profile
+                )
+                annual_contribution = savings_rate.savings / Decimal(months) * Decimal(12)
+        return project_retirement(
+            profile=profile,
+            starting_balance=starting_balance,
+            annual_contribution=annual_contribution,
+            retirement_age=retirement_age,
+        )
+
+
+def _empty_profile():
+    from perfin.core.models import UserProfile
+
+    return UserProfile()
 
 
 def _add_months(date: dt.date, months: int) -> dt.date:

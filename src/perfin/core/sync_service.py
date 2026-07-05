@@ -37,6 +37,33 @@ class SyncService:
         item = self._ensure_linked(source)
         return self.sync_item(source, item.item_id, full=full)
 
+    def link(self, source: DataSource) -> str:
+        result = source.link()
+        with session_scope(self._sessions) as session:
+            items = SqlItemRepo(session)
+            accounts = SqlAccountRepo(session)
+            items.upsert(result.item)
+            for account in result.accounts:
+                accounts.upsert(account)
+        return result.item.item_id
+
+    def ensure_fresh(
+        self, source: DataSource, *, staleness: dt.timedelta
+    ) -> SyncReport | None:
+        now = dt.datetime.now(dt.UTC)
+        with session_scope(self._sessions) as session:
+            items = SqlItemRepo(session)
+            matching = [item for item in items.list_all() if source.matches_item(item)]
+        if not matching:
+            return self.sync(source)
+        item = min(
+            matching,
+            key=lambda candidate: candidate.last_synced_at or dt.datetime.min.replace(tzinfo=dt.UTC),
+        )
+        if item.last_synced_at is None or now - _aware(item.last_synced_at) >= staleness:
+            return self.sync_item(source, item.item_id)
+        return None
+
     def sync_item(
         self, source: DataSource, item_id: str, *, full: bool = False
     ) -> SyncReport:
@@ -98,7 +125,7 @@ class SyncService:
     def _ensure_linked(self, source: DataSource):
         with session_scope(self._sessions) as session:
             items = SqlItemRepo(session)
-            existing = items.list_all()
+            existing = [item for item in items.list_all() if source.matches_item(item)]
             if existing:
                 return existing[0]
             result = source.link()
@@ -107,3 +134,9 @@ class SyncService:
             for account in result.accounts:
                 accounts.upsert(account)
             return result.item
+
+
+def _aware(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value

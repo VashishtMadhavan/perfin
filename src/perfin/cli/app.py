@@ -7,6 +7,7 @@ staleness gate. Command modules register their own sub-apps / commands here.
 
 from __future__ import annotations
 
+import datetime as dt
 from decimal import Decimal
 
 import typer
@@ -19,6 +20,8 @@ from perfin.core.models import RiskTolerance
 from perfin.core.profile_service import ProfileService
 from perfin.core.sync_service import SyncService
 from perfin.datasources.fake_source import FakeDataSource
+from perfin.datasources.plaid_source import PlaidSource
+from perfin.secrets import DefaultSecretStore
 from perfin.storage.db import create_db_engine, create_session_factory, init_schema
 
 app = typer.Typer(
@@ -34,6 +37,16 @@ def _session_factory():
     engine = create_db_engine(settings.db_url)
     init_schema(engine)
     return create_session_factory(engine)
+
+
+def _source(source_name: str):
+    settings = get_settings()
+    name = settings.sync.default_source if source_name == "auto" else source_name
+    if name == "fake":
+        return FakeDataSource()
+    if name == "plaid":
+        return PlaidSource(settings, DefaultSecretStore())
+    raise typer.BadParameter("source must be 'auto', 'fake', or 'plaid'.")
 
 
 def _version_callback(value: bool) -> None:
@@ -57,23 +70,51 @@ def main(
     ),
 ) -> None:
     """Root callback: wire dependencies and gate on data freshness."""
-    # Dependency container + auto-sync gate are wired in later phases. Stash the
-    # flag now so command implementations and the future gate can read it.
     ctx.ensure_object(dict)
     ctx.obj["no_sync"] = no_sync
+    read_commands = {"spend", "networth", "savings-rate", "afford", "retire"}
+    if no_sync or ctx.invoked_subcommand not in read_commands:
+        return
+    settings = get_settings()
+    try:
+        SyncService(_session_factory()).ensure_fresh(
+            _source("auto"),
+            staleness=dt.timedelta(hours=settings.sync.staleness_hours),
+        )
+    except Exception as exc:
+        console.print(f"[yellow]Auto-sync skipped:[/yellow] {exc}")
+
+
+@app.command("link")
+def link_command(
+    source: str = typer.Option(
+        "plaid", "--source", help="Data source to link. Use 'plaid' or 'fake'."
+    ),
+    sync_after: bool = typer.Option(True, "--sync/--no-sync", help="Run initial sync."),
+) -> None:
+    """Link an institution or demo data source."""
+    data_source = _source(source)
+    service = SyncService(_session_factory())
+    if sync_after:
+        report = service.sync(data_source)
+        console.print(
+            f"Linked and synced {report.item_id}: {report.accounts} accounts, "
+            f"{report.added} added."
+        )
+    else:
+        item_id = service.link(data_source)
+        console.print(f"Linked {item_id}.")
 
 
 @app.command("sync")
 def sync_command(
     source: str = typer.Option(
-        "fake", "--source", help="Data source to sync. Phase 1 supports 'fake'."
+        "auto", "--source", help="Data source to sync: auto, fake, or plaid."
     ),
     full: bool = typer.Option(False, "--full", help="Reset the source cursor first."),
 ) -> None:
     """Sync accounts and transactions."""
-    if source != "fake":
-        raise typer.BadParameter("Only --source fake is implemented in Phase 1.")
-    report = SyncService(_session_factory()).sync(FakeDataSource(), full=full)
+    report = SyncService(_session_factory()).sync(_source(source), full=full)
     console.print(
         f"Synced {report.item_id}: {report.accounts} accounts, "
         f"{report.added} added, {report.modified} modified, "
@@ -134,13 +175,78 @@ def savings_rate_command(
     console.print(table)
 
 
+@app.command("afford")
+def afford_command(
+    amount: str = typer.Argument(..., help="Purchase amount, e.g. 3000."),
+    by_date: str | None = typer.Option(None, "--by-date", help="YYYY-MM-DD."),
+    months: int = typer.Option(3, "--months", min=1, help="Cash-flow lookback."),
+) -> None:
+    """Check whether a purchase fits current liquidity and cash flow."""
+    result = FinanceService(_session_factory()).affordability(
+        amount=_decimal_option(amount, "amount") or Decimal("0"),
+        months=months,
+        by_date=_date_option(by_date, "by date"),
+    )
+    verdict = "Yes" if result.affordable_now else "Not from cash over buffer"
+    if result.affordable_by_date is not None:
+        verdict = "Yes" if result.affordable_by_date else "Not by that date"
+    console.print(f"[bold]{verdict}[/bold]")
+    table = simple_table("Affordability", ["Metric", "Value"])
+    table.add_row("Amount", money(result.amount))
+    table.add_row("Liquid balance", money(result.liquid_balance))
+    table.add_row("Emergency buffer", money(result.emergency_buffer))
+    table.add_row("Available after buffer", money(result.available_after_buffer))
+    table.add_row("Monthly slack", money(result.monthly_slack))
+    if result.monthly_required is not None:
+        table.add_row("Monthly required", money(result.monthly_required))
+        table.add_row("Months until date", str(result.months_until_date))
+    console.print(table)
+
+
+@app.command("retire")
+def retire_command(
+    retirement_age: int | None = typer.Option(None, "--age", help="Target age."),
+    annual_contribution: str | None = typer.Option(
+        None, "--annual-contribution", help="Override annual savings contribution."
+    ),
+    months: int = typer.Option(12, "--months", min=1, help="Savings lookback."),
+) -> None:
+    """Run a deterministic compound-growth retirement projection."""
+    projection = FinanceService(_session_factory()).retirement_projection(
+        months=months,
+        annual_contribution=_decimal_option(
+            annual_contribution, "annual contribution"
+        ),
+        retirement_age=retirement_age,
+    )
+    console.print(
+        f"Projected balance at {projection.retirement_age}: "
+        f"[bold]{money(projection.projected_balance)}[/bold]"
+    )
+    table = simple_table("Retirement projection", ["Metric", "Value"])
+    table.add_row("Current age", str(projection.current_age or "-"))
+    table.add_row("Years", str(projection.years))
+    table.add_row("Starting balance", money(projection.starting_balance))
+    table.add_row("Annual contribution", money(projection.annual_contribution))
+    table.add_row("Expected return", f"{projection.expected_return * 100:.1f}%")
+    table.add_row("4% rule spend", money(projection.safe_annual_spend))
+    if projection.target_annual_spend is not None:
+        table.add_row("Target spend", money(projection.target_annual_spend))
+        table.add_row("Surplus", money(projection.surplus))
+    console.print(table)
+
+
 @app.command("profile")
 def profile_command(
     birth_year: int | None = typer.Option(None, "--birth-year"),
     annual_net_income: str | None = typer.Option(None, "--annual-net-income"),
     annual_gross_income: str | None = typer.Option(None, "--annual-gross-income"),
+    monthly_savings_target: str | None = typer.Option(None, "--monthly-savings-target"),
     emergency_fund_months: int | None = typer.Option(None, "--emergency-fund-months"),
     risk_tolerance: RiskTolerance | None = typer.Option(None, "--risk-tolerance"),
+    retirement_age_target: int | None = typer.Option(None, "--retirement-age-target"),
+    retirement_annual_spend: str | None = typer.Option(None, "--retirement-annual-spend"),
+    expected_return_override: float | None = typer.Option(None, "--expected-return"),
 ) -> None:
     """Show or update local planning profile values."""
     service = ProfileService(_session_factory())
@@ -150,8 +256,12 @@ def profile_command(
             birth_year,
             annual_net_income,
             annual_gross_income,
+            monthly_savings_target,
             emergency_fund_months,
             risk_tolerance,
+            retirement_age_target,
+            retirement_annual_spend,
+            expected_return_override,
         )
     ):
         profile = service.update(
@@ -160,8 +270,16 @@ def profile_command(
             annual_gross_income=_decimal_option(
                 annual_gross_income, "annual gross income"
             ),
+            monthly_savings_target=_decimal_option(
+                monthly_savings_target, "monthly savings target"
+            ),
             emergency_fund_months=emergency_fund_months,
             risk_tolerance=risk_tolerance,
+            retirement_age_target=retirement_age_target,
+            retirement_annual_spend=_decimal_option(
+                retirement_annual_spend, "retirement annual spend"
+            ),
+            expected_return_override=expected_return_override,
         )
     else:
         profile = service.get()
@@ -169,8 +287,17 @@ def profile_command(
     table.add_row("Birth year", str(profile.birth_year or "-"))
     table.add_row("Annual gross income", money(profile.annual_gross_income))
     table.add_row("Annual net income", money(profile.annual_net_income))
+    table.add_row("Monthly savings target", money(profile.monthly_savings_target))
     table.add_row("Emergency fund months", str(profile.emergency_fund_months))
     table.add_row("Risk tolerance", str(profile.risk_tolerance))
+    table.add_row("Retirement age target", str(profile.retirement_age_target or "-"))
+    table.add_row("Retirement annual spend", money(profile.retirement_annual_spend))
+    expected = (
+        "-"
+        if profile.expected_return_override is None
+        else f"{profile.expected_return_override * 100:.1f}%"
+    )
+    table.add_row("Expected return override", expected)
     console.print(table)
 
 
@@ -181,6 +308,15 @@ def _decimal_option(value: str | None, label: str) -> Decimal | None:
         return Decimal(value)
     except Exception as exc:
         raise typer.BadParameter(f"{label} must be a decimal number") from exc
+
+
+def _date_option(value: str | None, label: str) -> dt.date | None:
+    if value is None:
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter(f"{label} must use YYYY-MM-DD") from exc
 
 
 if __name__ == "__main__":
