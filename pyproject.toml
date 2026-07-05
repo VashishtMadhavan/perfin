@@ -1,0 +1,37 @@
+[project]
+name = "perfin"
+version = "0.1.0"
+description = "A one-stop personal finance CLI: account sync, spending/net-worth analytics, and LLM-powered planning."
+readme = "README.md"
+authors = [
+    { name = "VashishtMadhavan", email = "vashisht.madhavan@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "typer>=0.15",
+    "rich>=13.9",
+    "sqlalchemy>=2.0",
+    "alembic>=1.14",
+    "plaid-python>=27.0",
+    "anthropic>=0.69",
+    "pydantic-settings>=2.7",
+    "keyring>=25.5",
+    "platformdirs>=4.3",
+    "numpy>=2.2",
+]
+
+[project.scripts]
+perfin = "perfin.cli.app:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.8,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
